@@ -1409,6 +1409,80 @@ static int ios_alias_store_pair( uint32_t insn, uintptr_t addr, uint64_t gpr[32]
     return 1;
 }
 
+/* The fault address is a store's first byte only when the store's first page
+ * is the one that faulted. An unaligned store that starts on a host-writable
+ * page and runs into a non-writable one reports the first byte of the second
+ * page, and writes nothing (measured on Apple M2 for 2- to 16-byte stores; a
+ * store across two protected pages reports its start). The single-register
+ * branches of the alias store emulator write at the fault address, so such a
+ * store landed at the page boundary: its first bytes stayed stale and its tail
+ * overwrote the bytes after it. HotSpot's relocation fix-ups did this to its
+ * code cache once write repair had made some of its pages host-writable; W^X
+ * demotion (madeira-wx) makes the same neighbours.
+ *
+ * Returns the access's first byte for a single-register store whose access
+ * contains the fault address, else the fault address unchanged. Pairs have
+ * ios_alias_store_pair, and release stores (STLR) must be aligned. gpr[31] is
+ * SP when used as a base; register 31 as an index is XZR. */
+static uintptr_t ios_store_access_start( uint32_t insn, const uint64_t gpr[32], uintptr_t fault_addr )
+{
+    unsigned rn = (insn >> 5) & 31, bytes, scale;
+    int64_t offset;
+    uintptr_t start;
+
+    /* Load/store register: bits 29:27 = 111 and bit 25 = 0. */
+    if ((insn & 0x3a000000u) == 0x38000000u)
+    {
+        unsigned simd = (insn >> 26) & 1, opc = (insn >> 22) & 3, size = insn >> 30;
+
+        if (opc & 1) return fault_addr;                     /* loads */
+        if (!simd && opc) return fault_addr;                /* signed loads, PRFM */
+        if (simd && opc == 2 && size) return fault_addr;    /* unallocated */
+        scale = (simd && opc == 2) ? 4 : size;              /* STR Qn is 16 bytes */
+        bytes = 1u << scale;
+        if (insn & 0x01000000u)                             /* unsigned 12-bit immediate */
+            offset = (int64_t)(((insn >> 10) & 0xfff) << scale);
+        else if (insn & 0x00200000u)                        /* register offset */
+        {
+            unsigned rm = (insn >> 16) & 31, option = (insn >> 13) & 7, shift = (insn >> 12) & 1;
+            uint64_t index = rm == 31 ? 0 : gpr[rm];
+
+            /* bits 11:10 = 00 here are the LSE atomics, which are not plain stores */
+            if (((insn >> 10) & 3) != 2) return fault_addr;
+            switch (option)
+            {
+            case 2: index = (uint32_t)index; break;                     /* UXTW */
+            case 6: index = (uint64_t)(int64_t)(int32_t)index; break;   /* SXTW */
+            case 3: case 7: break;                                      /* LSL, SXTX */
+            default: return fault_addr;
+            }
+            offset = (int64_t)(index << (shift ? scale : 0));
+        }
+        else                                                /* signed 9-bit immediate */
+        {
+            unsigned mode = (insn >> 10) & 3;               /* 0 unscaled, 1 post, 2 STTR, 3 pre */
+
+            if (simd && mode == 2) return fault_addr;
+            offset = (insn >> 12) & 0x1ff;
+            if (offset & 0x100) offset -= 0x200;
+            if (mode == 1) offset = 0;                      /* post-index stores at the old base */
+        }
+    }
+    /* STLUR family (LRCPC2): ss01 1001 000i iiii iiii 00nn nnnt tttt */
+    else if ((insn & 0x3fe00c00u) == 0x19000000u)
+    {
+        bytes = 1u << (insn >> 30);
+        offset = (insn >> 12) & 0x1ff;
+        if (offset & 0x100) offset -= 0x200;
+    }
+    else return fault_addr;
+
+    start = (uintptr_t)(gpr[rn] + (uint64_t)offset);
+    if (start > UINTPTR_MAX - (bytes - 1)) return fault_addr;
+    if (fault_addr > start && fault_addr - start < bytes) return start;
+    return fault_addr;
+}
+
 /* Signal-safe 32/64-bit CAS core, shared semantics with the BSD alias path.
  * Caller establishes full alias coverage. FP/LR encodings deliberately
  * decline: Darwin's __x array contains only x0..x28. No Wine logging here. */
@@ -3347,6 +3421,27 @@ static void *ios_mach_exception_thread( void *arg )
                     uint32_t insn; ios_fault_read_insn( (uint64_t)(uintptr_t)fault_pc, &insn );  /* ml982 */
                     int emulated = 0;
                     uintptr_t alias_fault = 0;
+                    /* The single-register branches below store at fault_addr, so make
+                     * it the store's first byte (see ios_store_access_start). */
+                    {
+                        uint64_t gpr[32];
+                        uintptr_t start;
+                        memcpy( gpr, state.__x, sizeof(state.__x) );
+                        gpr[29] = state.__fp;
+                        gpr[30] = state.__lr;
+                        gpr[31] = state.__sp;
+                        start = ios_store_access_start( insn, gpr, fault_addr );
+                        if (start != fault_addr && ios_write_alias( start ))
+                        {
+                            static unsigned start_logs;
+                            if (start_logs++ < 16)
+                                dprintf( 2, "[store-start] insn=%08x pc=%llx fault=%llx is inside the store at %llx\n",
+                                         insn, (unsigned long long)fault_pc, (unsigned long long)fault_addr,
+                                         (unsigned long long)start );
+                            fault_addr = start;
+                            rw_addr = ios_write_alias( start );
+                        }
+                    }
                     /* STP (SIMD&FP, signed offset, 128-bit Q): 10 101 1 1 0 0 0 imm7 Rt2 Rn Rt
                      *   pattern bits 31-22: 10 1011 1000  → top10 = 0x2B8 (= bits 31..22)
                      *   So mask 0xFFC00000 = top10. Match 0x2B8 << 22 = 0xAE000000? Hmm.
